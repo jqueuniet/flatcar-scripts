@@ -9,8 +9,6 @@
 #   source ./set_sbkeys_env
 #   source ./set_sbkeys_env --keys-dir /path/to/keys
 
-set -euo pipefail
-
 SCRIPT_ROOT=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 
 usage() {
