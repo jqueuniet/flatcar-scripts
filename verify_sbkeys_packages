@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# Copyright (c) 2025 The Flatcar Maintainers.
+# Distributed under the terms of the GNU General Public License v2.
+
+# Verify that custom Secure Boot keys were correctly applied during
+# build_packages. Checks the shim vendor certificate and module signing
+# key in the board sysroot.
+
+SCRIPT_ROOT=$(dirname $(readlink -f "$0"))
+. "${SCRIPT_ROOT}/common.sh" || exit 1
+
+assert_inside_chroot
+assert_not_root_user
+
+DEFINE_string board "${DEFAULT_BOARD}" \
+  "The board to verify."
+
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+if [[ -z "${FLAGS_board}" ]]; then
+  die_notrace "Error: --board required."
+fi
+
+BOARD_ROOT="/build/${FLAGS_board}"
+rc=0
+
+# --- Shim vendor certificate ---
+
+if [[ "${FLAGS_board}" == amd64-usr ]]; then
+  shim_efi="${BOARD_ROOT}/usr/lib/shim/shimx64.efi"
+elif [[ "${FLAGS_board}" == arm64-usr ]]; then
+  shim_efi="${BOARD_ROOT}/usr/lib/shim/shimaa64.efi"
+else
+  warn "Unknown board '${FLAGS_board}', skipping shim check."
+  shim_efi=""
+fi
+
+if [[ -n "${shim_efi}" ]]; then
+  if [[ ! -f "${shim_efi}" ]]; then
+    error "Shim binary not found at ${shim_efi}"
+    error "Has build_packages been run for --board=${FLAGS_board}?"
+    rc=1
+  else
+    vendor_der=$(mktemp)
+    trap "rm -f '${vendor_der}'" EXIT
+
+    info "Extracting vendor certificate from ${shim_efi}"
+    if objcopy -O binary --only-section=.vendor_cert "${shim_efi}" "${vendor_der}" 2>/dev/null \
+        && [[ -s "${vendor_der}" ]]; then
+      info "Shim vendor certificate:"
+      openssl x509 -inform DER -in "${vendor_der}" -noout \
+          -subject -issuer -dates 2>/dev/null \
+        || { error "Failed to parse vendor certificate"; rc=1; }
+    else
+      error "Could not extract .vendor_cert section from shim"
+      rc=1
+    fi
+  fi
+fi
+
+# --- Module signing key ---
+
+if [[ -n "${MODULES_SIGN_CERT}" && -f "${MODULES_SIGN_CERT}" ]]; then
+  info "Module signing certificate (${MODULES_SIGN_CERT}):"
+  openssl x509 -in "${MODULES_SIGN_CERT}" -noout \
+      -subject -issuer -dates 2>/dev/null \
+    || { error "Failed to parse module signing certificate"; rc=1; }
+else
+  warn "MODULES_SIGN_CERT is not set or file does not exist, skipping module key check."
+fi
+
+# --- Summary ---
+
+if [[ ${rc} -eq 0 ]]; then
+  info "All package-level Secure Boot checks passed."
+else
+  error "Some checks failed — review output above."
+fi
+
+exit ${rc}

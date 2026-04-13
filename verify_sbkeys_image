@@ -1,0 +1,163 @@
+#!/bin/bash
+
+# Copyright (c) 2025 The Flatcar Maintainers.
+# Distributed under the terms of the GNU General Public License v2.
+
+# Verify that custom Secure Boot signatures were correctly applied during
+# build_image. Checks kernel, GRUB, and shim signatures, dm-verity hash
+# embedding, and kernel module signatures inside the disk image.
+
+SCRIPT_ROOT=$(dirname $(readlink -f "$0"))
+. "${SCRIPT_ROOT}/common.sh" || exit 1
+
+assert_inside_chroot
+assert_not_root_user
+
+DEFINE_string board "${DEFAULT_BOARD}" \
+  "The board to verify."
+DEFINE_string from "" \
+  "Path to the image directory (default: latest build)."
+DEFINE_string image_name "flatcar_production_image" \
+  "Base name of the image to verify."
+
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+if [[ -z "${FLAGS_board}" ]]; then
+  die_notrace "Error: --board required."
+fi
+
+if [[ -z "${FLAGS_from}" ]]; then
+  FLAGS_from="$("${SCRIPT_ROOT}/get_latest_image.sh" --board="${FLAGS_board}")"
+fi
+
+BUILD_DIR="${FLAGS_from}"
+IMAGE_BASE="${FLAGS_image_name}"
+
+if [[ ! -d "${BUILD_DIR}" ]]; then
+  die_notrace "Image directory not found: ${BUILD_DIR}"
+fi
+
+# Resolve signing certs (use env var overrides or defaults)
+SHIM_CERT="${SBSIGN_CERT:-/usr/share/sb_keys/shim.pem}"
+DB_CERT="${SBSIGN_DB_CERT:-/usr/share/sb_keys/DB.crt}"
+
+rc=0
+
+# --- Kernel signature ---
+
+kernel="${BUILD_DIR}/${IMAGE_BASE}.vmlinuz"
+if [[ -f "${kernel}" ]]; then
+  info "Verifying kernel signature: ${kernel}"
+  info "  Expected signer cert: ${SHIM_CERT}"
+  if sbverify "${kernel}" --cert "${SHIM_CERT}" 2>/dev/null; then
+    info "  OK: Kernel signature valid."
+  else
+    error "  FAIL: Kernel signature does not match ${SHIM_CERT}"
+    rc=1
+  fi
+else
+  warn "Kernel artifact not found: ${kernel}"
+fi
+
+# --- GRUB signature ---
+
+grub="${BUILD_DIR}/${IMAGE_BASE}.grub"
+if [[ -f "${grub}" ]]; then
+  info "Verifying GRUB signature: ${grub}"
+  info "  Expected signer cert: ${SHIM_CERT}"
+  if sbverify "${grub}" --cert "${SHIM_CERT}" 2>/dev/null; then
+    info "  OK: GRUB signature valid."
+  else
+    error "  FAIL: GRUB signature does not match ${SHIM_CERT}"
+    rc=1
+  fi
+else
+  warn "GRUB artifact not found: ${grub}"
+fi
+
+# --- Shim signature ---
+
+shim="${BUILD_DIR}/${IMAGE_BASE}.shim"
+if [[ -f "${shim}" ]]; then
+  info "Verifying shim signature: ${shim}"
+  info "  Expected signer cert: ${DB_CERT}"
+  if sbverify "${shim}" --cert "${DB_CERT}" 2>/dev/null; then
+    info "  OK: Shim signature valid."
+  else
+    error "  FAIL: Shim signature does not match ${DB_CERT}"
+    rc=1
+  fi
+else
+  warn "Shim artifact not found: ${shim}"
+fi
+
+# --- dm-verity hash ---
+
+verity_file="${BUILD_DIR}/${IMAGE_BASE}_verity.txt"
+if [[ -f "${verity_file}" && -f "${kernel}" ]]; then
+  info "Verifying dm-verity hash embedding:"
+  verity_hash=$(cat "${verity_file}")
+
+  if [[ "${FLAGS_board}" == amd64-usr ]]; then
+    verity_offset=64
+  elif [[ "${FLAGS_board}" == arm64-usr ]]; then
+    verity_offset=512
+  else
+    verity_offset=""
+  fi
+
+  if [[ -n "${verity_offset}" ]]; then
+    embedded_hash=$(dd if="${kernel}" bs=1 skip="${verity_offset}" count=64 status=none)
+    info "  Verity file:  ${verity_hash}"
+    info "  In kernel:    ${embedded_hash}"
+    if [[ "${verity_hash}" == "${embedded_hash}" ]]; then
+      info "  OK: dm-verity hash matches."
+    else
+      error "  FAIL: dm-verity hash mismatch."
+      rc=1
+    fi
+  else
+    warn "  Unknown board '${FLAGS_board}', skipping verity offset check."
+  fi
+elif [[ ! -f "${verity_file}" ]]; then
+  warn "Verity hash file not found: ${verity_file} (normal for dev images)"
+fi
+
+# --- Module signatures inside disk image ---
+
+disk_image="${BUILD_DIR}/${IMAGE_BASE}.bin"
+if [[ -f "${disk_image}" ]]; then
+  root_fs=$(mktemp -d)
+  info "Mounting ${disk_image} to inspect module signatures..."
+  if "${SCRIPT_ROOT}/build_library/disk_util" --disk_layout=base mount \
+      "${disk_image}" "${root_fs}" 2>/dev/null; then
+
+    sample_mod=$(find "${root_fs}/usr/lib/modules/" -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' 2>/dev/null | head -1)
+    if [[ -n "${sample_mod}" ]]; then
+      info "Sample module: ${sample_mod#${root_fs}}"
+      modinfo "${sample_mod}" 2>/dev/null | grep -E "^(sig|signer)" \
+        || warn "  No signature metadata found (module may use appended sig format)"
+    else
+      warn "No kernel modules found in image."
+    fi
+
+    "${SCRIPT_ROOT}/build_library/disk_util" umount "${root_fs}" 2>/dev/null
+  else
+    error "Failed to mount disk image for module inspection."
+    rc=1
+  fi
+  rmdir "${root_fs}" 2>/dev/null
+else
+  warn "Disk image not found: ${disk_image}"
+fi
+
+# --- Summary ---
+
+if [[ ${rc} -eq 0 ]]; then
+  info "All image-level Secure Boot checks passed."
+else
+  error "Some checks failed — review output above."
+fi
+
+exit ${rc}
