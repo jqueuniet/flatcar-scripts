@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Copyright (c) 2025 The Flatcar Maintainers.
+# Distributed under the terms of the GNU General Public License v2.
+
+# Generate a complete set of test Secure Boot keys for building a Flatcar
+# derivative. The keys are written to a local directory and the script
+# prints the environment variables needed to use them with the build.
+#
+# This script runs on the host (outside the SDK container).
+# Only openssl is required.
+
+set -euo pipefail
+
+SCRIPT_ROOT=$(dirname "$(readlink -f "$0")")
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Generate Secure Boot test keys for Flatcar derivative builds.
+
+Options:
+  --output-dir DIR   Directory to write keys to (default: ./sb-keys)
+  --subj-prefix STR  Subject prefix for certificate CNs (default: "Flatcar Derivative")
+  --days N           Certificate validity in days (default: 7300, ~20 years)
+  --help             Show this help message
+
+The generated directory will contain:
+
+  UEFI firmware keys (for enrollment only, not used by the build):
+    PK.key, PK.crt       Platform Key
+    KEK.key, KEK.crt     Key Exchange Key
+
+  Build signing keys (referenced via environment variables):
+    DB.key, DB.crt       Signs shim
+    shim.key, shim.pem   Signs GRUB, MOK Manager, kernel
+    shim.der             Embedded in shim as vendor certificate
+EOF
+  exit "${1:-0}"
+}
+
+OUTPUT_DIR="${SCRIPT_ROOT}/sb-keys"
+SUBJ_PREFIX="Flatcar Derivative"
+DAYS=7300
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
+    --subj-prefix) SUBJ_PREFIX="$2"; shift 2 ;;
+    --days)        DAYS="$2"; shift 2 ;;
+    --help|-h)     usage 0 ;;
+    *)             echo "Unknown option: $1" >&2; usage 1 ;;
+  esac
+done
+
+if [[ -d "${OUTPUT_DIR}" ]] && [[ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null)" ]]; then
+  echo "Error: ${OUTPUT_DIR} already exists and is not empty." >&2
+  echo "Remove it first or choose a different --output-dir." >&2
+  exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+
+echo "Generating Secure Boot keys in ${OUTPUT_DIR}/"
+echo
+
+# --- Platform Key (firmware root of trust) ---
+
+echo "  PK (Platform Key)..."
+openssl req -new -x509 -newkey rsa:2048 -sha256 -days "${DAYS}" \
+    -subj "/CN=${SUBJ_PREFIX} Platform Key/" -nodes \
+    -keyout "${OUTPUT_DIR}/PK.key" -out "${OUTPUT_DIR}/PK.crt" 2>/dev/null
+
+# --- Key Exchange Key (authorizes db updates) ---
+
+echo "  KEK (Key Exchange Key)..."
+openssl req -new -x509 -newkey rsa:2048 -sha256 -days "${DAYS}" \
+    -subj "/CN=${SUBJ_PREFIX} Key Exchange Key/" -nodes \
+    -keyout "${OUTPUT_DIR}/KEK.key" -out "${OUTPUT_DIR}/KEK.crt" 2>/dev/null
+
+# --- Signature Database Key (signs shim) ---
+
+echo "  DB (Signature Database Key)..."
+openssl req -new -x509 -newkey rsa:2048 -sha256 -days "${DAYS}" \
+    -subj "/CN=${SUBJ_PREFIX} Secure Boot DB/" -nodes \
+    -keyout "${OUTPUT_DIR}/DB.key" -out "${OUTPUT_DIR}/DB.crt" 2>/dev/null
+
+# --- Shim / Vendor Key (embedded in shim, signs GRUB + kernel) ---
+
+echo "  Shim (Vendor Key)..."
+openssl genrsa -out "${OUTPUT_DIR}/shim.key" 2048 2>/dev/null
+openssl req -new -x509 -sha256 -days "${DAYS}" \
+    -subj "/CN=${SUBJ_PREFIX} Shim Key/" \
+    -key "${OUTPUT_DIR}/shim.key" -out "${OUTPUT_DIR}/shim.pem" 2>/dev/null
+openssl x509 -in "${OUTPUT_DIR}/shim.pem" -inform PEM \
+    -out "${OUTPUT_DIR}/shim.der" -outform DER
+
+chmod 600 "${OUTPUT_DIR}"/*.key
+
+echo
+echo "Keys generated in ${OUTPUT_DIR}/:"
+ls -1 "${OUTPUT_DIR}/"
+echo
+
+# Compute the container-internal path.
+# The scripts repo is mounted at /home/sdk/trunk/src/scripts inside the container.
+CONTAINER_KEYS_DIR="/home/sdk/trunk/src/scripts/${OUTPUT_DIR#${SCRIPT_ROOT}/}"
+
+cat <<EOF
+To use these keys, export the following before running ./run_sdk_container:
+
+  export SBSIGN_KEY="${CONTAINER_KEYS_DIR}/shim.key"
+  export SBSIGN_CERT="${CONTAINER_KEYS_DIR}/shim.pem"
+  export SBSIGN_DB_KEY="${CONTAINER_KEYS_DIR}/DB.key"
+  export SBSIGN_DB_CERT="${CONTAINER_KEYS_DIR}/DB.crt"
+  export SHIM_SIGNING_CERTIFICATE="${CONTAINER_KEYS_DIR}/shim.der"
+
+For UEFI firmware enrollment (QEMU/OVMF):
+
+  virt-fw-vars \\
+      --set-pk  ${OUTPUT_DIR}/PK.crt \\
+      --set-kek ${OUTPUT_DIR}/KEK.crt \\
+      --set-db  ${OUTPUT_DIR}/DB.crt \\
+      --secure-boot --output OVMF_VARS.custom.fd
+EOF

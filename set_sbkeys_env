@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# Copyright (c) 2025 The Flatcar Maintainers.
+# Distributed under the terms of the GNU General Public License v2.
+
+# Export Secure Boot key environment variables for use with run_sdk_container.
+# This script must be sourced, not executed:
+#
+#   source ./set_sbkeys_env
+#   source ./set_sbkeys_env --keys-dir /path/to/keys
+
+set -euo pipefail
+
+SCRIPT_ROOT=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+
+usage() {
+  cat <<'EOF'
+Usage: source ./set_sbkeys_env [OPTIONS]
+
+Export Secure Boot key environment variables for the SDK container.
+
+Options:
+  --keys-dir DIR   Directory containing the keys (default: ./sb-keys)
+  --help           Show this help message
+
+This script must be sourced so the variables are set in your current shell:
+
+  source ./set_sbkeys_env
+  ./run_sdk_container -t
+EOF
+}
+
+KEYS_DIR="${SCRIPT_ROOT}/sb-keys"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keys-dir) KEYS_DIR="$2"; shift 2 ;;
+    --help|-h)  usage; return 0 2>/dev/null || exit 0 ;;
+    *)          echo "Unknown option: $1" >&2; usage; return 1 2>/dev/null || exit 1 ;;
+  esac
+done
+
+# Resolve to absolute path
+KEYS_DIR=$(readlink -f "${KEYS_DIR}")
+
+if [[ ! -d "${KEYS_DIR}" ]]; then
+  echo "Error: Keys directory not found: ${KEYS_DIR}" >&2
+  echo "Run ./generate_sbkeys first." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# Verify all required files exist
+missing=0
+for f in DB.key DB.crt shim.key shim.pem shim.der; do
+  if [[ ! -f "${KEYS_DIR}/${f}" ]]; then
+    echo "Error: Missing key file: ${KEYS_DIR}/${f}" >&2
+    missing=1
+  fi
+done
+if [[ ${missing} -ne 0 ]]; then
+  return 1 2>/dev/null || exit 1
+fi
+
+# Compute the container-internal path.
+# The scripts repo is mounted at /home/sdk/trunk/src/scripts inside the container.
+CONTAINER_KEYS_DIR="/home/sdk/trunk/src/scripts/${KEYS_DIR#${SCRIPT_ROOT}/}"
+
+export SBSIGN_KEY="${CONTAINER_KEYS_DIR}/shim.key"
+export SBSIGN_CERT="${CONTAINER_KEYS_DIR}/shim.pem"
+export SBSIGN_DB_KEY="${CONTAINER_KEYS_DIR}/DB.key"
+export SBSIGN_DB_CERT="${CONTAINER_KEYS_DIR}/DB.crt"
+export SHIM_SIGNING_CERTIFICATE="${CONTAINER_KEYS_DIR}/shim.der"
+
+echo "Secure Boot key environment set (keys from ${KEYS_DIR}):"
+echo "  SBSIGN_KEY=${SBSIGN_KEY}"
+echo "  SBSIGN_CERT=${SBSIGN_CERT}"
+echo "  SBSIGN_DB_KEY=${SBSIGN_DB_KEY}"
+echo "  SBSIGN_DB_CERT=${SBSIGN_DB_CERT}"
+echo "  SHIM_SIGNING_CERTIFICATE=${SHIM_SIGNING_CERTIFICATE}"
